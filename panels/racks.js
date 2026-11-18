@@ -506,38 +506,42 @@ ${R} .nm-tbl td.warn{color:${C.partial};font-weight:600}
     mount(el, model, kit) {
       const S = shared(kit, PAGE);
       const { C, esc } = S;
-      v = S.view(el, { viewDir: [0, 1.35, 0.85] });
+      const V3 = THREE.Vector3;
 
-      const PX = 1.0;         // col pitch
-      const PZ = 1.7;         // row pitch (cold aisle between rows)
-      const POD_GAP = 1.6;    // extra aisle between pods
-      const SITE_GAP = 7;     // gap between site halls
+      // ---------- layout constants (spacing only; all counts come from the data) ----------
+      const PX = 1.0;          // col pitch
+      const PZ = 1.7;          // row pitch
+      const POD_GAP = 1.6;     // extra aisle between pods
       const RACK = [0.78, 1.5, 1.1];
       const SPINE_Y = 6;
+      const VIEW_DIR = [0, 1.45, 0.9];
+
+      let userMoved = false;
+      let selLines = null;
+      v = S.view(el, { viewDir: VIEW_DIR, onSelect: (id) => selectDevice(id) });
+      v.controls.addEventListener('start', () => { userMoved = true; });
+      injectPageStyle();
 
       const tors = kit.devicesByTier('top_of_rack');
       const spines = kit.devicesByTier('spine');
       const siteCodes = model.sites.map((s) => s.code).filter((c) => tors.some((d) => d.site === c));
 
-      const rackItems = [], ghosts = [], spineItems = [], podRows = [];
-      const posOf = new Map();
-      const podIds = new Map();  // "site|pod" -> Set of device ids (racks + spines)
-      let x0 = 0;
-
-      for (const site of siteCodes) {
+      // ---------- pass 1: each site's hall in local coordinates ----------
+      const halls = siteCodes.map((site) => {
         const racks = tors.filter((d) => d.site === site);
-        // Racks without row/col (should not happen) go on an extra row at the back, so nothing is lost.
         const placed = racks.filter((d) => d.row != null && d.col != null);
         const maxCol = Math.max(1, ...placed.map((d) => d.col));
         const minRow = Math.min(1, ...placed.map((d) => d.row));
         let maxRow = Math.max(minRow, ...placed.map((d) => d.row));
         const rc = new Map(placed.map((d) => [d.id, { row: d.row, col: d.col }]));
+        // Racks without row/col (should not happen) go on extra rows at the back, so nothing is lost.
         racks.filter((d) => !rc.has(d.id)).forEach((d, i) => rc.set(d.id, { row: maxRow + 1 + Math.floor(i / maxCol), col: 1 + (i % maxCol) }));
         maxRow = Math.max(maxRow, ...[...rc.values()].map((p) => p.row));
 
-        // Which pod owns each row, so we can open an aisle between pods.
+        // Which pod owns each row. A row with no racks at all belongs to the pod before it.
         const rowPod = new Map();
         for (const d of racks) { const r = rc.get(d.id).row; if (!rowPod.has(r)) rowPod.set(r, d.pod); }
+        for (let r = minRow, last; r <= maxRow; r++) { if (rowPod.has(r)) last = rowPod.get(r); else if (last !== undefined) rowPod.set(r, last); }
         const rowZ = new Map();
         let z = 0, prevPod;
         for (let r = minRow; r <= maxRow; r++) {
@@ -547,104 +551,455 @@ ${R} .nm-tbl td.warn{color:${C.partial};font-weight:600}
           z += PZ;
           if (p !== undefined) prevPod = p;
         }
-        const at = (row, col) => [x0 + (col - 1) * PX, 0, rowZ.get(row)];
+        return { site, racks, rc, minRow, maxRow, maxCol, rowPod, rowZ, w: (maxCol - 1) * PX, d: rowZ.get(maxRow) + RACK[2] };
+      });
 
-        // Every grid slot with no rack is a missing rack: draw it as an empty outline.
-        const taken = new Set(racks.map((d) => { const p = rc.get(d.id); return `${p.row},${p.col}`; }));
-        for (let r = minRow; r <= maxRow; r++) {
-          for (let c = 1; c <= maxCol; c++) {
-            if (!taken.has(`${r},${c}`)) ghosts.push({ ghost: true, site, row: r, col: c, pod: rowPod.get(r), pos: at(r, c) });
+      // ---------- pass 2: arrange halls in a grid that best fits the screen (works for any number of sites) ----------
+      const aspect = (v.stage.clientWidth || 1100) / (v.stage.clientHeight || 800);
+      const cellW = Math.max(...halls.map((h) => h.w), 1) + 7;
+      const cellD = Math.max(...halls.map((h) => h.d), 1) + 9;
+      let perRow = 1, best = -1;
+      for (let k = 1; k <= Math.max(1, halls.length); k++) {
+        const score = Math.min(aspect / (k * cellW), 1 / (Math.ceil(halls.length / k) * cellD * 0.8));
+        if (score > best + 1e-9) { best = score; perRow = k; }
+      }
+      halls.forEach((h, i) => { h.ox = (i % perRow) * cellW; h.oz = Math.floor(i / perRow) * cellD; });
+
+      // ---------- pass 3: devices, empty slots, pods ----------
+      const rackItems = [], ghosts = [], spineItems = [], pods = [];
+      const posOf = new Map();
+      const recOf = new Map();
+      const content = new THREE.Box3();
+      const grow = (x, y, z) => content.expandByPoint(new V3(x, y, z));
+
+      for (const H of halls) {
+        const at = (row, col) => [H.ox + (col - 1) * PX, 0, H.oz + H.rowZ.get(row)];
+        const taken = new Set(H.racks.map((d) => { const p = H.rc.get(d.id); return `${p.row},${p.col}`; }));
+        for (let r = H.minRow; r <= H.maxRow; r++) {
+          for (let c = 1; c <= H.maxCol; c++) {
+            if (!taken.has(`${r},${c}`)) ghosts.push({ ghost: true, site: H.site, row: r, col: c, pod: H.rowPod.get(r), pos: at(r, c) });
           }
         }
-        for (const d of racks) {
-          const p = rc.get(d.id);
-          const it = Object.assign(S.health(d.id), { pos: at(p.row, p.col) });
+        for (const d of H.racks) {
+          const p = H.rc.get(d.id);
+          const it = Object.assign(S.health(d.id), { pos: at(p.row, p.col), site: d.site, pod: d.pod, row: p.row, col: p.col });
           rackItems.push(it);
           posOf.set(d.id, it.pos);
+          recOf.set(d.id, it);
         }
+        const x0 = H.ox, x1 = H.ox + H.w, z0 = H.oz, z1 = H.oz + H.d;
+        grow(x0 - RACK[0], 0, z0 - RACK[2]); grow(x1 + RACK[0], RACK[1], z1);
 
-        // Hall floor and site name.
-        const zEnd = rowZ.get(maxRow) + RACK[2];
-        v.floor(x0 - 1.2, -1.2, x0 + (maxCol - 1) * PX + 1.2, zEnd + 0.6, { color: '#121821' });
-        v.label(`${kit.siteName(site)} (${site})`, [x0 + ((maxCol - 1) * PX) / 2, SPINE_Y + 3, -1.5], { size: 1.4 });
+        // Hall floor, site title, row numbers.
+        v.floor(x0 - 1.4, z0 - 1.4, x1 + 1.4, z1 + 0.6, { color: '#111720', edge: '#2b3442' });
+        const titleSize = Math.max(1.3, (H.w + 2) * 0.085);
+        v.label(`${kit.siteName(H.site)} (${H.site})`, [(x0 + x1) / 2, SPINE_Y + 2.6, z0 - 1.5], { size: titleSize });
+        grow((x0 + x1) / 2, SPINE_Y + 2.6 + titleSize, z0 - 1.5);
+        for (let r = H.minRow; r <= H.maxRow; r++) {
+          v.label(`r${r}`, [x1 + 1.05, 0.3, H.oz + H.rowZ.get(r)], { size: 0.42, bg: false, color: '#6e7681' });
+        }
+        grow(x1 + 1.6, 0, z0);
 
-        // Pods: label, spines floating above the pod, and a row in the side table.
-        for (const [pod, list] of S.groupBy(racks, (d) => d.pod)) {
+        // Pods: label, spines floating above the pod, a hoverable floor plate.
+        for (const [pod, list] of S.groupBy(H.racks, (d) => d.pod)) {
           const xs = list.map((d) => posOf.get(d.id)[0]), zs = list.map((d) => posOf.get(d.id)[2]);
-          const minX = Math.min(...xs), maxX = Math.max(...xs), midZ = (Math.min(...zs) + Math.max(...zs)) / 2;
-          if (pod != null) v.label(`pod ${pod}`, [minX - 1.9, 0.6, midZ], { size: 0.6, bg: false, color: C.muted });
-          const podSpines = spines.filter((s) => s.site === site && s.pod === pod)
+          const podRowsSet = new Set([...H.rowPod].filter(([, p]) => p === pod).map(([r]) => r));
+          const podZs = [...podRowsSet].map((r) => H.oz + H.rowZ.get(r));
+          const minX = x0, maxX = x1;
+          const minZ = Math.min(...zs, ...podZs), maxZ = Math.max(...zs, ...podZs), midZ = (minZ + maxZ) / 2;
+          if (pod != null) v.label(`pod ${pod}`, [minX - 2.2, 0.5, midZ], { size: 0.62, color: '#c9d1d9' });
+          grow(minX - 3.4, 0, midZ);
+          const podSpines = spines.filter((s) => s.site === H.site && s.pod === pod)
             .sort((a, b) => (a.plane ?? 0) - (b.plane ?? 0) || (a.id < b.id ? -1 : 1));
           podSpines.forEach((s, i) => {
-            const x = podSpines.length === 1 ? (minX + maxX) / 2 : minX + (i * (maxX - minX)) / (podSpines.length - 1);
+            const x = podSpines.length === 1 ? (minX + maxX) / 2 : minX + 1 + (i * (maxX - minX - 2)) / (podSpines.length - 1);
             const it = Object.assign(S.health(s.id, kit.linksOf(s.id)), { pos: [x, SPINE_Y, midZ] });
             spineItems.push(it);
             posOf.set(s.id, it.pos);
+            grow(x, SPINE_Y + 0.5, midZ);
           });
-          const ids = new Set([...list.map((d) => d.id), ...podSpines.map((s) => s.id)]);
-          podIds.set(`${site}|${pod}`, ids);
-          const hs = rackItems.filter((it) => ids.has(it.id));
-          const podRowsSet = new Set(list.map((d) => rc.get(d.id).row));
-          podRows.push({
-            site: kit.siteName(site), siteCode: site, pod,
-            racks: list.length,
-            withBroken: hs.filter((it) => it.broken > 0).length,
-            withPartial: hs.filter((it) => it.partial > 0).length,
-            drained: hs.filter((it) => it.drained).length,
-            empty: ghosts.filter((g) => g.site === site && podRowsSet.has(g.row)).length,
-            center: [(minX + maxX) / 2, 1, midZ], span: Math.max(maxX - minX, 4),
+          pods.push({
+            site: H.site, pod, rows: podRowsSet, spineIds: podSpines.map((s) => s.id),
+            pos: [(minX + maxX) / 2, 0.005, midZ], size: [maxX - minX + 1.2, 0.02, maxZ - minZ + RACK[2] + 0.5],
+            center: [(minX + maxX) / 2, 1, midZ], span: Math.max(maxX - minX, maxZ - minZ) + 2,
           });
+          void xs;
         }
-        x0 += (maxCol - 1) * PX + SITE_GAP;
       }
 
-      // ---- draw ----
+      // ---------- per-rack facts used by the table, tooltips and filters ----------
+      const spineDrained = (id) => !!kit.device(id)?.drained;
+      for (const it of rackItems) {
+        const ups = kit.uplinks(it.id);
+        it.toDrained = ups.filter((l) => spineDrained(S.otherEnd(l, it.id))).length;
+        it.siteName = kit.siteName(it.site);
+      }
+
+      // ---------- draw ----------
       const rackBody = (it) => (it.drained ? C.drained : it.linkWorst === 'ok' ? C.body : C[it.linkWorst]);
-      v.boxes(rackItems, { pos: (it) => it.pos, size: RACK, color: rackBody, tip: S.deviceTip });
-      // Status "LED" cap on top of each rack (from nVisual's rack LED idea): uplink health, even on drained racks.
-      v.boxes(rackItems, { pos: (it) => [it.pos[0], RACK[1], it.pos[2]], size: [RACK[0] * 0.9, 0.12, RACK[2] * 0.9], color: (it) => C[it.linkWorst], pick: false });
-      v.boxes(ghosts, {
-        pos: (g) => g.pos, size: [RACK[0], 0.06, RACK[2]], color: () => C.empty, opacity: 0.55,
-        tip: (g) => `<b>Empty slot (missing rack)</b><br><span class="k">${esc(kit.siteName(g.site))} · row ${g.row} col ${g.col}${g.pod != null ? ` · pod ${g.pod}` : ''}</span>`,
-      });
+      v.boxes(rackItems, { pos: (it) => it.pos, size: RACK, color: rackBody, tip: rackTip });
+      // Status "LED" cap on each rack (nVisual idea): uplink health, visible even on drained racks.
+      v.boxes(rackItems, { pos: (it) => [it.pos[0], RACK[1], it.pos[2]], size: [RACK[0] * 0.92, 0.14, RACK[2] * 0.92], color: (it) => C[it.linkWorst], pick: false });
       v.boxes(spineItems, {
-        pos: (it) => it.pos, size: [0.7, 0.45, 0.7], tip: S.deviceTip,
+        pos: (it) => it.pos, size: [0.8, 0.5, 0.8], tip: S.deviceTip,
         color: (it) => (it.drained ? C.drained : it.linkWorst === 'ok' ? '#6e8bb0' : C[it.linkWorst]),
       });
+      // Empty slots: hoverable translucent base + dashed full-height outline, so missing racks read as gaps.
+      v.boxes(ghosts, {
+        pos: (g) => g.pos, size: [RACK[0], 0.05, RACK[2]], color: () => '#2a3340', opacity: 0.6,
+        tip: (g) => `<b>Empty slot (missing rack)</b><br><span class="k">${esc(kit.siteName(g.site))} · row ${g.row} col ${g.col}${g.pod != null ? ` · pod ${esc(g.pod)}` : ''}</span>`,
+      });
+      drawGhostOutlines();
+      // Pod floor plates: hover for pod totals, click to focus the pod.
+      v.boxes(pods, {
+        pos: (p) => p.pos, size: (p) => p.size, color: () => '#18202b', tip: podTip, onClick: (p) => focusPod(p),
+      });
 
-      // Uplinks rack -> spine. Problem links always drawn; healthy ones are faint and can be toggled on.
+      // Uplinks rack -> spine. Problem links always drawn; links to a drained spine in purple; healthy ones optional.
       const segs = [];
       for (const it of rackItems) {
         for (const l of kit.uplinks(it.id)) {
-          const to = posOf.get(S.otherEnd(l, it.id));
+          const other = S.otherEnd(l, it.id), to = posOf.get(other);
           if (!to) continue;
-          segs.push({ a: [it.pos[0], RACK[1] + 0.12, it.pos[2]], b: [to[0], to[1], to[2]], state: S.linkState(l), ids: [l.a, l.b] });
+          let state = S.linkState(l);
+          if (state === 'ok' && spineDrained(other)) state = 'drained';
+          segs.push({ a: [it.pos[0], RACK[1] + 0.14, it.pos[2]], b: [to[0], to[1], to[2]], state, ids: [l.a, l.b] });
         }
       }
       v.lines(segs.filter((s) => s.state !== 'ok'));
-      const okLines = v.lines(segs.filter((s) => s.state === 'ok'), { opacity: 0.25 });
+      const okLines = v.lines(segs.filter((s) => s.state === 'ok'), { opacity: 0.22 });
       okLines.mesh.visible = false;
       v.toggle('Healthy uplinks', false, (on) => { okLines.mesh.visible = on; });
 
-      v.legend([
-        ['<span class="nm-sw ghost"></span>', 'Empty slot (missing rack)'],
-        [`<span class="nm-sw" style="background:#6e8bb0"></span>`, 'Spine (floating above its pod)'],
-      ]);
-
-      // Sortable per-pod table: the judge sorts a column to find an answer fast. Default order = site, pod.
-      v.sideTable('Pods', [
-        { key: 'site', label: 'Site' }, { key: 'pod', label: 'Pod', num: true }, { key: 'racks', label: 'Racks', num: true },
-        { key: 'withBroken', label: 'Broken uplink', num: true }, { key: 'withPartial', label: 'Partly broken', num: true },
-        { key: 'drained', label: 'Drained', num: true }, { key: 'empty', label: 'Empty slots', num: true },
-      ], podRows, (row) => {
-        v.setFocus(podIds.get(`${row.siteCode}|${row.pod}`), `${row.site} pod ${row.pod}`);
-        v.mark(null);
-        v.flyTo(new v.THREE.Vector3(...row.center), row.span * 0.6);
-      }, {
-        cellClass: (k, val) => (k === 'withBroken' && val > 0 ? 'bad' : k === 'withPartial' && val > 0 ? 'warn' : ''),
+      // Tight "Fit": replaces the toolbar's sphere fit; also used on open and whenever the page is resized.
+      const bar = v.stage.querySelector('.nm-bar');
+      const oldFit = [...bar.querySelectorAll('button')].find((b) => b.textContent === 'Fit');
+      if (oldFit) { const nb = oldFit.cloneNode(true); oldFit.replaceWith(nb); nb.addEventListener('click', () => { userMoved = false; fitTight(); }); }
+      const clearBtn = [...bar.querySelectorAll('button')].find((b) => b.textContent === 'Clear');
+      if (clearBtn) clearBtn.addEventListener('click', () => clearSelection());
+      v.root.addEventListener('keydown', (e) => { if (e.key === 'Escape') clearSelection(); });
+      let lw = 0, lh = 0;
+      v.onFrame(() => {
+        const w = v.stage.clientWidth, h = v.stage.clientHeight;
+        if (w !== lw || h !== lh) { lw = w; lh = h; if (!userMoved) fitTight(); }
       });
 
+      // ---------- side panel: legend + group-by table (the judge's speed tool) ----------
+      const card = document.createElement('div');
+      card.className = 'nm-box rk-card';
+      card.hidden = true;
+      v.stage.appendChild(card);
+      buildSidePanel();
 
+      // =====================================================================
+      function rackTip(it) {
+        const ups = kit.uplinks(it.id).map((l) => {
+          const s = S.linkState(l), o = S.otherEnd(l, it.id);
+          const col = s === 'ok' ? (spineDrained(o) ? C.drained : C.ok) : C[s];
+          return `<br><span style="color:${col}">●</span> ${esc(o)} <span class="k">${l.up}/${l.count} up${spineDrained(o) ? ' · spine drained' : ''}</span>`;
+        }).join('');
+        return `<b>${esc(it.id)}</b><br><span class="k">${esc(it.siteName)} · pod ${esc(it.pod)} · row ${it.row} col ${it.col}</span>`
+          + `${it.drained ? `<br><span style="color:${C.drained}">● Drained rack</span>` : ''}`
+          + `<br><span style="color:${C.broken}">Broken uplinks: ${it.broken}</span> · <span style="color:${C.partial}">Partly broken: ${it.partial}</span>${ups}`;
+      }
+
+      function podStats(p) {
+        const rs = rackItems.filter((r) => r.site === p.site && r.pod === p.pod);
+        const empty = ghosts.filter((g) => g.site === p.site && p.rows.has(g.row)).length;
+        return aggregate(rs, empty);
+      }
+      function podTip(p) {
+        const s = podStats(p);
+        return `<b>${esc(kit.siteName(p.site))} · pod ${esc(p.pod)}</b>`
+          + `<br><span class="k">Racks</span> ${s.racks} · <span class="k">Empty slots</span> ${s.empty}`
+          + `<br><span style="color:${C.broken}">Racks with a broken uplink: ${s.brokenRacks}</span>`
+          + `<br><span class="k">Broken uplinks</span> ${s.brokenLinks} · <span class="k">Racks with 2+ broken</span> ${s.multi}`
+          + `<br><span style="color:${C.partial}">Racks with a partly broken uplink: ${s.partialRacks}</span>`
+          + `<br><span style="color:${C.drained}">Drained racks: ${s.drained} · Racks wired to a drained spine: ${s.toDrained}</span>`
+          + `<br><span class="k">Click to focus this pod</span>`;
+      }
+
+      function aggregate(rs, empty) {
+        return {
+          racks: rs.length, empty,
+          brokenRacks: rs.filter((r) => r.broken > 0).length,
+          brokenLinks: rs.reduce((n, r) => n + r.broken, 0),
+          multi: rs.filter((r) => r.broken > 1).length,
+          partialRacks: rs.filter((r) => r.partial > 0).length,
+          drained: rs.filter((r) => r.drained).length,
+          toDrained: rs.filter((r) => r.toDrained > 0).length,
+        };
+      }
+
+      function drawGhostOutlines() {
+        if (!ghosts.length) return;
+        const [w, hgt, d] = RACK, hx = w / 2, hz = d / 2;
+        const corners = [[-hx, 0, -hz], [hx, 0, -hz], [hx, 0, hz], [-hx, 0, hz], [-hx, hgt, -hz], [hx, hgt, -hz], [hx, hgt, hz], [-hx, hgt, hz]];
+        const edges = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+        const pos = new Float32Array(ghosts.length * edges.length * 6);
+        let k = 0;
+        for (const g of ghosts) {
+          for (const [a, b] of edges) {
+            for (const c of [corners[a], corners[b]]) { pos[k++] = g.pos[0] + c[0]; pos[k++] = c[1]; pos[k++] = g.pos[2] + c[2]; }
+          }
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        const lines = new THREE.LineSegments(geo, new THREE.LineDashedMaterial({ color: '#9aa7b8', dashSize: 0.12, gapSize: 0.09 }));
+        lines.computeLineDistances();
+        v.world.add(lines);
+      }
+
+      // Camera distance from the projected corners of everything drawn, keeping clear of the toolbar.
+      function fitTight() {
+        const W = v.stage.clientWidth, Hh = v.stage.clientHeight;
+        if (!W || !Hh || content.isEmpty()) return;
+        const cam = v.camera;
+        cam.aspect = W / Hh; cam.updateProjectionMatrix();
+        const pts = [];
+        for (const x of [content.min.x, content.max.x]) for (const y of [content.min.y, content.max.y]) for (const z of [content.min.z, content.max.z]) pts.push(new V3(x, y, z));
+        const dir = new V3(...VIEW_DIR).normalize();
+        const topLim = 1 - (2 * (bar.offsetHeight + 22)) / Hh, botLim = -1 + 0.05, sideLim = 1 - 0.04;
+        const target = content.getCenter(new V3());
+        const tmp = new V3();
+        const bounds = (dist) => {
+          cam.position.copy(target).addScaledVector(dir, dist);
+          cam.lookAt(target); cam.updateMatrixWorld();
+          let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+          for (const p of pts) { tmp.copy(p).project(cam); x0 = Math.min(x0, tmp.x); x1 = Math.max(x1, tmp.x); y0 = Math.min(y0, tmp.y); y1 = Math.max(y1, tmp.y); }
+          return { x0, x1, y0, y1 };
+        };
+        const fits = (b) => b.x0 >= -sideLim && b.x1 <= sideLim && b.y0 >= botLim && b.y1 <= topLim;
+        let dist = 1;
+        for (let pass = 0; pass < 3; pass++) {
+          let lo = 1, hi = 20000;
+          for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (fits(bounds(mid))) hi = mid; else lo = mid; }
+          dist = hi;
+          // Re-center the projected box inside the free area, then search again.
+          const b = bounds(dist);
+          const dx = (b.x0 + b.x1) / 2, dy = (b.y0 + b.y1) / 2 - (topLim + botLim) / 2;
+          const halfH = Math.tan(THREE.MathUtils.degToRad(cam.fov) / 2) * dist;
+          const right = new V3().setFromMatrixColumn(cam.matrixWorld, 0), up = new V3().setFromMatrixColumn(cam.matrixWorld, 1);
+          target.addScaledVector(right, dx * halfH * cam.aspect).addScaledVector(up, dy * halfH);
+        }
+        bounds(dist);
+        cam.near = Math.max(0.05, dist / 200); cam.far = dist * 20; cam.updateProjectionMatrix();
+        v.controls.target.copy(target);
+        v.controls.update();
+      }
+
+      // ---------- selection: a rack shows its uplinks and spines; a spine shows its racks ----------
+      function clearSelection() {
+        if (selLines) { v.scene.remove(selLines); selLines.geometry.dispose(); selLines.material.dispose(); selLines = null; }
+        card.hidden = true;
+      }
+      function selectDevice(id) {
+        clearSelection();
+        const d = kit.device(id);
+        if (!d || !posOf.has(id)) return false;
+        const links = d.tier === 'top_of_rack' ? kit.uplinks(id) : kit.linksOf(id).filter((l) => posOf.has(S.otherEnd(l, id)) && kit.device(S.otherEnd(l, id)).tier === 'top_of_rack');
+        const p = posOf.get(id);
+        const top = d.tier === 'top_of_rack' ? RACK[1] + 0.14 : 0;
+        const ids = new Set([id]);
+        const pos = [], col = [];
+        const c = new THREE.Color();
+        const others = [];
+        for (const l of links) {
+          const o = S.otherEnd(l, id), q = posOf.get(o);
+          if (!q) continue;
+          ids.add(o); others.push(q);
+          const s = S.linkState(l);
+          c.set(s === 'ok' ? (spineDrained(d.tier === 'top_of_rack' ? o : id) ? C.drained : C.ok) : C[s]);
+          const qTop = kit.device(o).tier === 'top_of_rack' ? RACK[1] + 0.14 : 0;
+          pos.push(p[0], p[1] + top, p[2], q[0], q[1] + qTop, q[2]);
+          col.push(c.r, c.g, c.b, c.r, c.g, c.b);
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+        geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+        selLines = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false, transparent: true }));
+        selLines.renderOrder = 15;
+        v.scene.add(selLines);
+
+        const size = d.tier === 'top_of_rack' ? RACK : [0.8, 0.5, 0.8];
+        v.mark(new V3(p[0], p[1] + size[1] / 2, p[2]), size);
+        v.setFocus(ids, id);
+        const box = new THREE.Box3().setFromPoints([new V3(...p), ...others.map((q) => new V3(...q))]);
+        const sz = box.getSize(new V3());
+        v.flyTo(box.getCenter(new V3()), Math.max(4, sz.x, sz.z, sz.y) * 0.75);
+
+        const h = d.tier === 'top_of_rack' ? recOf.get(id) : S.health(id, links);
+        card.innerHTML = d.tier === 'top_of_rack'
+          ? `<button class="rk-x" title="Close">×</button>${rackTip(h)}`
+          : `<button class="rk-x" title="Close">×</button><b>${esc(id)}</b><br><span class="k">spine · ${esc(kit.siteName(d.site))} · pod ${esc(d.pod)} · plane ${esc(d.plane)}</span>`
+            + `${d.drained ? `<br><span style="color:${C.drained}">● Drained spine</span>` : ''}`
+            + `<br><span class="k">Racks wired to it</span> ${links.length}`
+            + `<br><span style="color:${C.broken}">Broken rack links: ${links.filter((l) => S.linkState(l) === 'broken').length}</span>`
+            + ` · <span style="color:${C.partial}">Partly broken: ${links.filter((l) => S.linkState(l) === 'partial').length}</span>`;
+        card.hidden = false;
+        card.querySelector('.rk-x').addEventListener('click', () => { clearSelection(); v.setFocus(null); v.mark(null); });
+        return true;
+      }
+
+      function focusGroup(ids, text, pts) {
+        clearSelection();
+        v.mark(null);
+        v.setFocus(new Set(ids), text);
+        if (!pts.length) return;
+        const box = new THREE.Box3().setFromPoints(pts.map((q) => new V3(...q)));
+        const sz = box.getSize(new V3());
+        v.flyTo(box.getCenter(new V3()), Math.max(4, sz.x, sz.z) * 0.62);
+      }
+      function focusPod(p) {
+        const rs = rackItems.filter((r) => r.site === p.site && r.pod === p.pod);
+        focusGroup([...rs.map((r) => r.id), ...p.spineIds], `${kit.siteName(p.site)} pod ${p.pod}`, [...rs.map((r) => r.pos), ...p.spineIds.map((s) => posOf.get(s))]);
+      }
+
+      function buildSidePanel() {
+        const side = document.createElement('div');
+        side.className = 'nm-side rk-side';
+        side.innerHTML = '<div class="nm-side-head"><button title="Show or hide the table">⟩</button><span class="nm-side-title">Find answers</span></div>';
+        const lg = v.legend([
+          ['<span class="nm-sw ghost"></span>', 'Empty slot (missing rack)'],
+          ['<span class="nm-sw" style="background:#6e8bb0"></span>', 'Spine (above its pod)'],
+          [`<span class="nm-sw ln" style="background:${C.drained}"></span>`, 'Uplink to a drained spine'],
+          ['<span class="nm-sw" style="background:#18202b;border:1px solid #2b3442"></span>', 'Pod floor: hover for totals'],
+        ]);
+        lg.classList.add('rk-legend');
+        side.appendChild(lg);
+        const groupsBar = document.createElement('div');
+        groupsBar.className = 'rk-groups';
+        groupsBar.innerHTML = '<span class="k">Group by</span>';
+        side.appendChild(groupsBar);
+        const wrap = document.createElement('div');
+        wrap.className = 'nm-tbl rk-tbl';
+        side.appendChild(wrap);
+        const note = document.createElement('div');
+        note.className = 'rk-key';
+        note.textContent = 'Click a column to sort, click a row to show it in 3D. Search any device name in the header.';
+        side.appendChild(note);
+        v.root.appendChild(side);
+        side.querySelector('.nm-side-head button').addEventListener('click', (e) => {
+          side.classList.toggle('rk-closed');
+          e.target.textContent = side.classList.contains('rk-closed') ? '⟨' : '⟩';
+        });
+
+        const N = (key, label, title) => ({ key, label, title, num: true });
+        const STATS = [
+          N('racks', 'Racks', 'Racks in this group'),
+          N('empty', 'Empty slots', 'Empty rack slots (missing racks)'),
+          N('brokenRacks', 'Racks w/ broken uplink', 'Racks with at least one broken uplink'),
+          N('brokenLinks', 'Broken uplinks', 'Broken rack-to-spine links'),
+          N('multi', 'Racks 2+ broken', 'Racks with two or more broken uplinks'),
+          N('partialRacks', 'Racks w/ partial', 'Racks with a partly broken uplink'),
+          N('drained', 'Drained racks', 'Drained racks'),
+          N('toDrained', 'Racks → drained spine', 'Racks with an uplink to a drained spine'),
+        ];
+        const siteRow = (site, rs, empty) => Object.assign({ siteName: kit.siteName(site), site }, aggregate(rs, empty));
+        const GROUPS = {
+          Site: {
+            cols: [{ key: 'siteName', label: 'Site' }, ...STATS],
+            rows: () => siteCodes.map((s) => Object.assign(siteRow(s, rackItems.filter((r) => r.site === s), ghosts.filter((g) => g.site === s).length), {
+              _ids: rackItems.filter((r) => r.site === s).map((r) => r.id), _text: kit.siteName(s) })),
+          },
+          Pod: {
+            cols: [{ key: 'siteName', label: 'Site' }, N('pod', 'Pod'), ...STATS],
+            rows: () => pods.map((p) => Object.assign({ siteName: kit.siteName(p.site), pod: p.pod }, podStats(p), { _pod: p })),
+          },
+          Row: {
+            cols: [{ key: 'siteName', label: 'Site' }, N('row', 'Row'), N('pod', 'Pod'), ...STATS],
+            rows: () => halls.flatMap((H) => {
+              const out = [];
+              for (let r = H.minRow; r <= H.maxRow; r++) {
+                const rs = rackItems.filter((x) => x.site === H.site && x.row === r);
+                const gs = ghosts.filter((g) => g.site === H.site && g.row === r);
+                out.push(Object.assign({ siteName: kit.siteName(H.site), row: r, pod: H.rowPod.get(r) ?? '' }, aggregate(rs, gs.length),
+                  { _ids: rs.map((x) => x.id), _pts: [...rs.map((x) => x.pos), ...gs.map((g) => g.pos)], _text: `${kit.siteName(H.site)} row ${r}` }));
+              }
+              return out;
+            }),
+          },
+          Rack: {
+            cols: [{ key: 'id', label: 'Rack' }, { key: 'siteName', label: 'Site' }, N('pod', 'Pod'), N('row', 'Row'), N('col', 'Col'),
+              N('up', 'Cables up'), N('total', 'Cables'), N('broken', 'Broken uplinks'), N('partial', 'Partly broken'),
+              { key: 'drainedTxt', label: 'Drained' }, N('toDrained', 'Uplinks → drained spine')],
+            rows: () => rackItems.map((r) => ({ id: r.id, siteName: r.siteName, pod: r.pod, row: r.row, col: r.col, up: r.up, total: r.total,
+              broken: r.broken, partial: r.partial, drainedTxt: r.drained ? 'yes' : '', toDrained: r.toDrained })),
+          },
+        };
+
+        let group = 'Pod', rows = [], sortKey = null, asc = true, selRow = null;
+        const bad = new Set(['brokenRacks', 'brokenLinks', 'multi', 'broken']);
+        const warn = new Set(['partialRacks', 'partial']);
+        const purple = new Set(['drained', 'toDrained', 'drainedTxt']);
+        function cellClass(k, val) {
+          if (!val || val === 0) return '';
+          return bad.has(k) ? 'bad' : warn.has(k) ? 'warn' : purple.has(k) ? 'rk-purple' : k === 'empty' ? 'rk-empty' : '';
+        }
+        function setGroup(g) {
+          group = g; rows = GROUPS[g].rows(); sortKey = null; asc = true; selRow = null;
+          for (const b of groupsBar.querySelectorAll('button')) b.classList.toggle('on', b.dataset.g === g);
+          draw();
+        }
+        function draw() {
+          const cols = GROUPS[group].cols;
+          const list = rows.slice();
+          if (sortKey) list.sort((a, b) => { const x = a[sortKey], y = b[sortKey]; return (x < y ? -1 : x > y ? 1 : 0) * (asc ? 1 : -1); });
+          const head = `<tr>${cols.map((c) => `<th data-k="${esc(c.key)}" class="${c.num ? 'num' : ''}" title="${esc(c.title || c.label)} (click to sort)">${esc(c.label)}${sortKey === c.key ? (asc ? ' ▲' : ' ▼') : ''}</th>`).join('')}</tr>`;
+          const body = list.map((r) => `<tr data-i="${rows.indexOf(r)}" class="${r === selRow ? 'sel' : ''}">${cols.map((c) => `<td class="${c.num ? 'num ' : ''}${cellClass(c.key, r[c.key])}">${esc(r[c.key])}</td>`).join('')}</tr>`).join('');
+          wrap.innerHTML = `<table>${head}${body}</table>`;
+        }
+        for (const g of Object.keys(GROUPS)) {
+          const b = document.createElement('button');
+          b.textContent = g; b.dataset.g = g;
+          b.addEventListener('click', () => setGroup(g));
+          groupsBar.appendChild(b);
+        }
+        wrap.addEventListener('click', (e) => {
+          const th = e.target.closest('th');
+          if (th) {
+            const k = th.dataset.k, col = GROUPS[group].cols.find((c) => c.key === k);
+            if (sortKey === k) asc = !asc; else { sortKey = k; asc = !col.num; }
+            draw(); return;
+          }
+          const tr = e.target.closest('tr[data-i]');
+          if (!tr) return;
+          selRow = rows[+tr.dataset.i];
+          draw();
+          if (group === 'Rack') kit.select(selRow.id);
+          else if (group === 'Pod') focusPod(selRow._pod);
+          else focusGroup(selRow._ids, selRow._text, selRow._pts || selRow._ids.map((i) => posOf.get(i)));
+        });
+        setGroup('Pod');
+      }
+
+      function injectPageStyle() {
+        if (document.getElementById('rk-style')) return;
+        const R = '#area-racks .nm';
+        const s = document.createElement('style');
+        s.id = 'rk-style';
+        s.textContent = `
+${R} .rk-side{width:470px}
+${R} .rk-side.rk-closed{width:250px}
+${R} .rk-side.rk-closed .rk-groups,${R} .rk-side.rk-closed .rk-tbl,${R} .rk-side.rk-closed .rk-key{display:none}
+${R} .rk-legend{position:static;box-shadow:none;border:0;border-bottom:1px solid ${C.line};border-radius:0;background:none;display:grid;grid-template-columns:1fr 1fr;gap:0 12px;padding:8px 10px}
+${R} .rk-side.rk-closed .rk-legend{grid-template-columns:1fr}
+${R} .rk-groups{display:flex;gap:5px;align-items:center;padding:8px;border-bottom:1px solid ${C.line}}
+${R} .rk-groups .k{color:${C.muted};margin-right:4px}
+${R} .rk-groups button{background:#161b22;color:${C.text};border:1px solid ${C.line};border-radius:7px;padding:4px 11px;font:inherit;cursor:pointer}
+${R} .rk-groups button.on{background:${C.select};border-color:${C.select};color:#0d1117;font-weight:600}
+${R} .rk-tbl th{white-space:normal;vertical-align:bottom;font-size:11px;line-height:1.2;min-width:34px}
+${R} .rk-tbl td{font-size:12px}
+${R} .rk-tbl th,${R} .rk-tbl td{padding:4px 3px}
+${R} .rk-tbl td.rk-purple{color:${C.drained};font-weight:600}
+${R} .rk-tbl td.rk-empty{color:#c9d1d9;font-weight:600}
+${R} .rk-key{color:${C.muted};padding:6px 10px;font-size:11px;border-top:1px solid ${C.line}}
+${R} .rk-card{right:10px;top:10px;max-width:330px;z-index:4}
+${R} .rk-card .k{color:${C.muted}}
+${R} .rk-x{float:right;background:none;border:0;color:${C.muted};font-size:16px;cursor:pointer;margin:-4px -4px 0 6px}
+`;
+        document.head.appendChild(s);
+      }
     },
     resize() { if (v) v.resize(); },
   };
