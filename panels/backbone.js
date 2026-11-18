@@ -512,13 +512,17 @@ ${R} .nm-tbl td.warn{color:${C.partial};font-weight:600}
       const stack = S.tierStack(v, ["backbone_router","border"]);
       v.legend();
 
-      // Sortable device list: per-device facts only, sorted when the judge clicks a header.
-      v.sideTable("Devices", [
-        { key: "id", label: "Device" }, { key: "tier", label: "Tier" },
-        { key: "broken", label: "Broken", num: true }, { key: "partial", label: "Partly", num: true }, { key: "drained", label: "Drained" },
-      ], stack.items.map((it) => ({ id: it.id, tier: it.d.tier.replace(/_/g, " "), broken: it.broken, partial: it.partial, drained: it.drained ? "yes" : "" })),
-      (row) => kit.select(row.id),
-      { cellClass: (k, val) => (k === "broken" && val > 0 ? "bad" : k === "partial" && val > 0 ? "warn" : "") });
+      // Sortable backbone circuit list (links between backbone routers at different sites).
+      const circuits = model.links.filter((l) => { const a = kit.device(l.a), b = kit.device(l.b);
+        return a.tier === 'backbone_router' && b.tier === 'backbone_router' && a.site !== b.site; });
+      v.sideTable("Backbone circuits", [
+        { key: "from", label: "From" }, { key: "to", label: "To" },
+        { key: "state", label: "State" }, { key: "up", label: "Up", num: true }, { key: "count", label: "Cables", num: true },
+        { key: "drained", label: "Drained end" },
+      ], circuits.map((l) => ({ from: l.a, to: l.b, state: S.linkState(l), up: l.up, count: l.count,
+        drained: [l.a, l.b].filter((i) => kit.device(i).drained).join(" ") })),
+      (row) => kit.select(row.from),
+      { cellClass: (k, val) => (k === "state" && val === "broken" ? "bad" : k === "state" && val === "partial" ? "warn" : "") });
     },
     resize() { if (v) v.resize(); },
   };
