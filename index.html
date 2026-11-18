@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network UI Map</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div id="app"><p class="nojs">If you can read this, the kit's scripts did not load. Unzip the whole folder first (on Windows: right-click the zip, then Extract All), then open index.html from the unzipped folder.</p></div>
+<!-- Plain scripts only, so this page works when you double-click index.html. Nothing to install. -->
+<script src="lib/d3.min.js"></script>
+<script src="lib/three.global.js"></script>
+<script src="js/core.js"></script>
+<script src="js/tasks.js"></script>
+<script src="js/app.js"></script>
+<!-- The topology the site draws. To draw a different one, replace topology.js and reload. -->
+<script src="topology.js"></script>
+<!-- Your team's pages, one file each. A broken file only breaks its own tab. -->
+<script>kit.loading('overview')</script><script src="panels/overview.js"></script>
+<script>kit.loading('backbone')</script><script src="panels/backbone.js"></script>
+<script>kit.loading('site')</script><script src="panels/site.js"></script>
+<script>kit.loading('pods')</script><script src="panels/pods.js"></script>
+<script>kit.loading('racks')</script><script src="panels/racks.js"></script>
+</body>
+</html>
